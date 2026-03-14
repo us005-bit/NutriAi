@@ -1,0 +1,9 @@
+.env
+nutrition_cache.json
+.chroma_db/
+__pycache__/
+*.pth
+*.pyc
+model/efficientnet_b2_best.pth
+venv/
+.venv/
