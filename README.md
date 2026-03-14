@@ -6,7 +6,7 @@
 ---
 
 ## Live API
-**Swagger UI:** `https://nutriai-api.up.railway.app/docs`
+**Swagger UI:** `https://nutri-ai-0jvj.onrender.com/docs`
 > Try every endpoint live — upload food photos, ask nutrition questions, run the onboarding agent.
 
 ---
