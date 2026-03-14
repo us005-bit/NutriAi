@@ -100,8 +100,11 @@ async def startup():
     await create_tables()
 
     # 2. Load EfficientNet-B2 classifier
-    from model.classifier import get_classifier
-    get_classifier()
+    try:
+        from model.classifier import get_classifier
+        get_classifier()
+    except FileNotFoundError:
+        log.warning("Model file not found — /predict endpoint will be unavailable")
 
     # 3. Pre-populate nutrition cache (all DB dishes → instant lookup)
     from nutrition import prepopulate_cache
