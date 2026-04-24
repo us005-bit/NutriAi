@@ -77,7 +77,7 @@ from langchain_core.messages import (
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.tools import tool
-from langchain_community.llms import HuggingFaceHub
+from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -194,21 +194,26 @@ TOOLS = [get_nutrition, get_daily_totals, get_weekly_summary]
 def _get_llm():
     """
     Return HuggingFace LLM with tool binding.
-    Uses Qwen 72B as primary — best for nutrition + Indian food context.
+    Uses ChatHuggingFace (not HuggingFaceHub) — only the Chat variant
+    supports .bind_tools() required for LangGraph tool calling.
+
+    Install: pip install -U langchain-huggingface
     """
     hf_key = os.getenv("HF_API_KEY")
     if not hf_key:
         raise RuntimeError("HF_API_KEY not set in .env")
 
-    llm = HuggingFaceHub(
+    # HuggingFaceEndpoint is the underlying model
+    endpoint = HuggingFaceEndpoint(
         repo_id="Qwen/Qwen2.5-72B-Instruct",
         huggingfacehub_api_token=hf_key,
-        model_kwargs={
-            "temperature": 0.4,
-            "max_new_tokens": 400,
-        },
+        temperature=0.4,
+        max_new_tokens=400,
+        task="text-generation",
     )
-    # Bind tools so LLM knows what it can call
+
+    # ChatHuggingFace wraps endpoint into a ChatModel — exposes bind_tools()
+    llm = ChatHuggingFace(llm=endpoint)
     return llm.bind_tools(TOOLS)
 
 

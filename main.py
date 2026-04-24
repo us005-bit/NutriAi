@@ -14,8 +14,9 @@ Endpoints:
 
   FOOD CLASSIFIER
     POST /predict                   image → dish + nutrition
-    POST /nutrition                 dish name → nutrition (5-layer)
+    POST /nutrition                 dish name + quantity → nutrition (5-layer)
     POST /suggest                   over-target → food swap suggestion
+    GET  /portion-presets           frontend dropdown: label → grams mapping
 
   OCR — MESS MENU SETUP (one-time)
     POST /ocr/scan                  photo → matched dishes + natural units
@@ -77,7 +78,7 @@ log = logging.getLogger("nutriai.main")
 app = FastAPI(
     title       = "NutriAI API",
     description = "Agentic nutrition assistant for Indian college mess students",
-    version     = "3.0.0",
+    version     = "3.1.0",
 )
 
 app.add_middleware(
@@ -89,11 +90,84 @@ app.add_middleware(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# PORTION PRESETS
+# These map human-readable portion labels (shown in frontend dropdowns) to
+# approximate gram weights used for LLM prompt construction.
+#
+# Format: { label: { grams: int, quantity_str: str } }
+#   label       → shown in dropdown  e.g. "1 ladle"
+#   grams       → approximate weight used for scale_nutrition()
+#   quantity_str→ injected into LLM prompt e.g. "1 ladle (~150g)"
+#
+# Mess-specific portions (ladle, scoop, piece) are intentionally approximate
+# because hostel mess serving sizes vary. The LLM is told the approximate
+# weight so it returns a realistic calorie value rather than a generic one.
+# ══════════════════════════════════════════════════════════════════════════════
+PORTION_PRESETS: dict[str, dict] = {
+    # ── Generic ───────────────────────────────────────────────────────────────
+    "1 standard serving" : {"grams": 150,  "quantity_str": "1 standard serving"},
+    "Half serving"       : {"grams": 75,   "quantity_str": "half serving (~75g)"},
+    "Double serving"     : {"grams": 300,  "quantity_str": "double serving (~300g)"},
+
+    # ── Mess-style ladles / scoops ────────────────────────────────────────────
+    "1 ladle"            : {"grams": 150,  "quantity_str": "1 ladle (~150g)"},
+    "2 ladles"           : {"grams": 300,  "quantity_str": "2 ladles (~300g)"},
+    "1 small scoop"      : {"grams": 80,   "quantity_str": "1 small scoop (~80g)"},
+    "1 large scoop"      : {"grams": 180,  "quantity_str": "1 large scoop (~180g)"},
+
+    # ── Plate / bowl ──────────────────────────────────────────────────────────
+    "Quarter plate"      : {"grams": 100,  "quantity_str": "quarter plate (~100g)"},
+    "Half plate"         : {"grams": 200,  "quantity_str": "half plate (~200g)"},
+    "Full plate"         : {"grams": 400,  "quantity_str": "full plate (~400g)"},
+    "1 small bowl"       : {"grams": 150,  "quantity_str": "1 small bowl (~150g)"},
+    "1 large bowl"       : {"grams": 300,  "quantity_str": "1 large bowl (~300g)"},
+
+    # ── Cup ───────────────────────────────────────────────────────────────────
+    "Half cup"           : {"grams": 120,  "quantity_str": "half cup (~120g)"},
+    "1 cup"              : {"grams": 240,  "quantity_str": "1 cup (~240g)"},
+    "2 cups"             : {"grams": 480,  "quantity_str": "2 cups (~480g)"},
+
+    # ── Pieces (rotis, momos, idlis, etc.) ───────────────────────────────────
+    "1 piece"            : {"grams": 50,   "quantity_str": "1 piece (~50g)"},
+    "2 pieces"           : {"grams": 100,  "quantity_str": "2 pieces (~100g)"},
+    "3 pieces"           : {"grams": 150,  "quantity_str": "3 pieces (~150g)"},
+    "4 pieces"           : {"grams": 200,  "quantity_str": "4 pieces (~200g)"},
+    "6 pieces"           : {"grams": 300,  "quantity_str": "6 pieces (~300g)"},
+
+    # ── Weight (manual) ───────────────────────────────────────────────────────
+    "100g"               : {"grams": 100,  "quantity_str": "100g"},
+    "150g"               : {"grams": 150,  "quantity_str": "150g"},
+    "200g"               : {"grams": 200,  "quantity_str": "200g"},
+    "250g"               : {"grams": 250,  "quantity_str": "250g"},
+    "300g"               : {"grams": 300,  "quantity_str": "300g"},
+}
+
+
+def _resolve_quantity(portion_label: Optional[str], custom_grams: Optional[float]) -> str:
+    """
+    Resolve the quantity string to pass into get_nutrition().
+
+    Priority:
+        1. custom_grams  — user typed an exact weight (e.g. 175g)
+        2. portion_label — user picked from dropdown
+        3. default       — "1 standard serving"
+    """
+    if custom_grams and custom_grams > 0:
+        return f"{int(custom_grams)}g"
+    if portion_label and portion_label in PORTION_PRESETS:
+        return PORTION_PRESETS[portion_label]["quantity_str"]
+    if portion_label:
+        # Unknown label — pass it directly to the LLM as-is
+        return portion_label
+    return "1 standard serving"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # STARTUP
 # ══════════════════════════════════════════════════════════════════════════════
 @app.on_event("startup")
 async def startup():
-    log.info("Starting NutriAI backend v3...")
+    log.info("Starting NutriAI backend v3.1...")
 
     # 1. Create PostgreSQL tables
     from database import create_tables
@@ -124,7 +198,7 @@ async def startup():
     except Exception as e:
         log.warning(f"Chatbot graph init skipped: {e}")
 
-    log.info("NutriAI backend v3 ready ✅")
+    log.info("NutriAI backend v3.1 ready ✅")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -133,17 +207,22 @@ async def startup():
 
 # ── Nutrition ─────────────────────────────────────────────────────────────────
 class ManualEntryRequest(BaseModel):
-    dish_name: str
+    dish_name    : str
+    # Portion — one of the two below should be provided; both are optional.
+    # If neither is given, defaults to "1 standard serving".
+    portion_label: Optional[str]   = None   # e.g. "1 ladle", "Half plate"
+    custom_grams : Optional[float] = None   # e.g. 175.0 — user typed exact weight
 
 class NutritionResult(BaseModel):
-    dish       : str
-    calories   : float
-    protein    : float
-    carbs      : float
-    fats       : float
-    portion_g  : float
+    dish        : str
+    calories    : float
+    protein     : float
+    carbs       : float
+    fats        : float
+    portion_g   : float
     serving_desc: Optional[str] = None
-    source     : str
+    source      : str
+    confidence  : Optional[str] = None   # "high" | "medium" | "low" | "db"
 
 class PredictionResponse(BaseModel):
     top_prediction  : dict
@@ -201,7 +280,7 @@ class OnboardingResponse(BaseModel):
 # ── Meal logging ──────────────────────────────────────────────────────────────
 class LogMealRequest(BaseModel):
     user_id           : str
-    meal_slot         : str       # breakfast | lunch | snacks | dinner
+    meal_slot         : str        # breakfast | lunch | snacks | dinner
     dish_key          : str
     display_name      : str
     calories          : float
@@ -209,7 +288,7 @@ class LogMealRequest(BaseModel):
     carbs             : float
     fats              : float
     serving_desc      : Optional[str]  = None
-    portion_multiplier: float = 1.0   # 1.0 = standard, 2.0 = double
+    portion_multiplier: float = 1.0    # legacy — kept for backward compat
     source            : str   = "menu" # menu | scan | custom
     notes             : Optional[str]  = None
     log_date          : Optional[str]  = None  # YYYY-MM-DD, defaults to today
@@ -225,7 +304,7 @@ class GapAnalysisRequest(BaseModel):
 class GapConfirmRequest(BaseModel):
     user_id : str
     day     : str
-    accepted: bool      # True = add to plan, False = skip
+    accepted: bool
 
 # ── Weekly review ─────────────────────────────────────────────────────────────
 class WeeklyReviewResponse(BaseModel):
@@ -237,7 +316,7 @@ class WeeklyReviewResponse(BaseModel):
 class ChatRequest(BaseModel):
     user_id  : str
     message  : str
-    thread_id: Optional[str] = None  # defaults to user_id
+    thread_id: Optional[str] = None
 
 class RAGRequest(BaseModel):
     question   : str
@@ -258,7 +337,7 @@ class RAGResponse(BaseModel):
 
 @app.get("/")
 def root():
-    return {"message": "NutriAI backend v3 running 🍛", "status": "ok"}
+    return {"message": "NutriAI backend v3.1 running 🍛", "status": "ok"}
 
 
 @app.get("/health")
@@ -274,13 +353,45 @@ def health():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# PORTION PRESETS — frontend dropdown data
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/portion-presets")
+def get_portion_presets():
+    """
+    Return all available portion labels for the frontend dropdown.
+    Frontend uses these to build the portion picker UI.
+
+    Response shape:
+        {
+          "presets": [
+            { "label": "1 ladle", "grams": 150, "quantity_str": "1 ladle (~150g)" },
+            ...
+          ]
+        }
+    """
+    presets = [
+        {"label": label, **data}
+        for label, data in PORTION_PRESETS.items()
+    ]
+    return {"presets": presets}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # FOOD CLASSIFIER
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/predict", response_model=PredictionResponse)
-async def predict(file: UploadFile = File(...)):
+async def predict(
+    file         : UploadFile    = File(...),
+    portion_label: Optional[str] = None,
+    custom_grams : Optional[float] = None,
+):
     """
     Image upload → dish classification → nutrition lookup.
+    Optionally pass portion_label or custom_grams so nutrition reflects
+    the actual amount eaten, not a generic serving.
+
     Used in daily log tab when user scans food photo.
     """
     if file.content_type not in ("image/jpeg", "image/png", "image/jpg", "image/webp"):
@@ -296,7 +407,9 @@ async def predict(file: UploadFile = File(...)):
     classifier = get_classifier()
     prediction = classifier.predict(image_bytes, top_k=3)
     top_dish   = prediction["top_prediction"]["dish"]
-    nutr       = get_nutrition_safe(top_dish)
+
+    quantity = _resolve_quantity(portion_label, custom_grams)
+    nutr     = get_nutrition_safe(top_dish, quantity=quantity)
 
     if nutr.get("error"):
         return PredictionResponse(
@@ -305,9 +418,10 @@ async def predict(file: UploadFile = File(...)):
             nutrition_error= nutr["message"],
         )
 
+    nutr_fields = {k: nutr[k] for k in NutritionResult.model_fields if k in nutr}
     return PredictionResponse(
         **prediction,
-        nutrition      = NutritionResult(**nutr),
+        nutrition      = NutritionResult(**nutr_fields),
         nutrition_error= None,
     )
 
@@ -315,19 +429,30 @@ async def predict(file: UploadFile = File(...)):
 @app.post("/nutrition", response_model=NutritionResult)
 def get_nutrition_endpoint(request: ManualEntryRequest):
     """
-    Dish name → nutrition via 5-layer pipeline.
-    Used when user types a custom food item in daily log.
+    Dish name + optional portion → nutrition via 5-layer pipeline.
+
+    The portion is passed into the LLM prompt so returned macros reflect
+    the actual quantity, not just a reference serving.
+
+    Examples:
+        { "dish_name": "Dal Tadka", "portion_label": "1 ladle" }
+        { "dish_name": "Paneer Butter Masala", "custom_grams": 175 }
+        { "dish_name": "Veg Momos", "portion_label": "6 pieces" }
+        { "dish_name": "Rice", "portion_label": "Half plate" }
     """
     if not request.dish_name.strip():
         raise HTTPException(400, "Dish name cannot be empty.")
 
     from nutrition import get_nutrition_safe
-    result = get_nutrition_safe(request.dish_name)
+
+    quantity = _resolve_quantity(request.portion_label, request.custom_grams)
+    result   = get_nutrition_safe(request.dish_name, quantity=quantity)
+
     if result.get("error"):
         raise HTTPException(404, result["message"])
-    return NutritionResult(**{
-        k: result[k] for k in NutritionResult.model_fields if k in result
-    })
+
+    nutr_fields = {k: result[k] for k in NutritionResult.model_fields if k in result}
+    return NutritionResult(**nutr_fields)
 
 
 @app.post("/suggest", response_model=SuggestionResponse)
@@ -449,7 +574,6 @@ async def save_menu(request: SaveMenuRequest):
 
     count = await save_mess_menu(request.dishes, request.institution_id)
 
-    # Upsert into ChromaDB so chatbot has menu context
     try:
         menu_grouped = await get_mess_menu_grouped(request.institution_id)
         upsert_menu(menu_grouped)
@@ -547,7 +671,6 @@ async def update_weight(user_id: str, new_weight: float):
     if not profile:
         raise HTTPException(404, "User not found.")
 
-    # Map DB columns back to profile dict format
     profile_dict = {
         "name"         : profile.get("name"),
         "age"          : profile.get("age"),
@@ -580,7 +703,8 @@ async def log_meal_endpoint(request: LogMealRequest):
     """
     Log a meal item for a user.
     Source can be: menu (selected from mess menu), scan (photo), custom (typed).
-    Portion multiplier handles natural serving adjustments.
+    The calories/protein/carbs/fats sent here should already be quantity-adjusted
+    by the frontend (using the /nutrition endpoint with portion_label).
     """
     from database import log_meal
 
@@ -641,7 +765,6 @@ async def get_totals(user_id: str):
     """
     Today's macro totals + remaining vs targets.
     Used by progress bar in daily log tab.
-    Shows: eaten kcal, protein, carbs, fats + how much left.
     """
     from database import get_today_totals
     totals = await get_today_totals(user_id)
@@ -656,7 +779,6 @@ async def get_log_history(
 ):
     """
     Fetch meal logs for a date range.
-    Used by history tab.
     Dates in YYYY-MM-DD format.
     """
     from database import get_date_range_logs
@@ -694,8 +816,6 @@ async def start_gap_analysis(request: GapAnalysisRequest):
         2. Finds days where calorie or protein gap > 10% of target
         3. Generates specific food recommendations to fill gaps
         4. Pauses for HITL — returns first recommendation for user to confirm
-
-    Returns first pending recommendation immediately.
     """
     from database import get_user_profile
     from agent import run_gap_analysis
@@ -724,12 +844,9 @@ async def start_gap_analysis(request: GapAnalysisRequest):
 async def confirm_gap_recommendation(request: GapConfirmRequest):
     """
     Human-in-the-loop response for gap analysis.
-
     Frontend shows the pending recommendation, user taps:
         "Add to plan" → accepted=True
         "Skip"        → accepted=False
-
-    Returns next pending recommendation or status=done.
     """
     from agent import confirm_recommendation
 
@@ -744,10 +861,7 @@ async def confirm_gap_recommendation(request: GapConfirmRequest):
 
 @app.get("/gap/status/{user_id}")
 async def gap_analysis_status(user_id: str):
-    """
-    Get current gap analysis state for a user.
-    Used by frontend to resume if user closes and reopens the app mid-flow.
-    """
+    """Get current gap analysis state for a user."""
     from agent import get_gap_graph
     graph     = get_gap_graph()
     thread_id = f"gap_{user_id}"
@@ -775,12 +889,7 @@ async def gap_analysis_status(user_id: str):
 async def weekly_review(user_id: str):
     """
     Generate 7-day review for a user.
-    Reads from PostgreSQL — no localStorage needed.
-
-    Returns:
-        stats    : per-day breakdown + 7-day averages
-        insights : specific observations (calorie gap, protein, consistency)
-        summary  : LLM narrative or rule-based fallback
+    Returns: stats, insights, summary
     """
     from database import get_user_profile
     from agent import run_weekly_review
@@ -838,15 +947,7 @@ async def chat_endpoint(request: ChatRequest):
 async def chat_stream_endpoint(request: ChatRequest):
     """
     Send a message → streaming response (token by token).
-    Use this for the chat UI — shows text appearing in real time.
-    Also streams tool call notifications:
-        "[Looking up nutrition info...]"
-        "[Checking today's intake...]"
-
-    Frontend usage:
-        const resp = await fetch('/chat/stream', { method: 'POST', body: ... })
-        const reader = resp.body.getReader()
-        // read chunks as they arrive
+    Also streams tool call notifications.
     """
     from database import get_user_profile
     from chatbot import stream_chat
@@ -873,11 +974,7 @@ async def chat_stream_endpoint(request: ChatRequest):
 
 @app.get("/chat/history/{user_id}")
 async def get_chat_history(user_id: str, limit: int = 20):
-    """
-    Fetch recent conversation history.
-    Used by frontend to restore chat on app open.
-    Returns list of { role, content } dicts.
-    """
+    """Fetch recent conversation history."""
     from chatbot import get_chat_history
     history = await get_chat_history(user_id, limit=limit)
     return {"user_id": user_id, "history": history, "count": len(history)}
@@ -897,10 +994,7 @@ async def clear_chat_history(user_id: str):
 
 @app.post("/rag/ask", response_model=RAGResponse)
 async def rag_ask(request: RAGRequest):
-    """
-    Direct RAG nutrition Q&A — bypasses chatbot conversation flow.
-    Used for one-off nutrition questions without chat context.
-    """
+    """Direct RAG nutrition Q&A — bypasses chatbot conversation flow."""
     if not request.question.strip():
         raise HTTPException(400, "Question cannot be empty.")
 
@@ -922,10 +1016,7 @@ async def rag_ask(request: RAGRequest):
 
 @app.post("/rag/populate")
 def rag_populate(force: bool = False):
-    """
-    Re-populate ChromaDB with nutrition_db.
-    Admin endpoint — call if you update nutrition_db.py.
-    """
+    """Re-populate ChromaDB with nutrition_db. Admin endpoint."""
     try:
         from rag import populate_nutrition_db
         count = populate_nutrition_db(force=force)

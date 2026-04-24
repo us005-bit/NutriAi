@@ -1,0 +1,59 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# NutriAI — docker-compose.yml
+#
+# Services:
+#   api        FastAPI backend (main.py via uvicorn)
+#
+# External dependencies (not containerised here):
+#   PostgreSQL  → use Neon serverless (set DATABASE_URL in .env)
+#   ChromaDB    → embedded, persisted to ./volumes/chroma_db
+
+services:
+
+  # ── NutriAI FastAPI backend ─────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+
+    image: nutriai-api:latest
+    container_name: nutriai_api
+
+    restart: unless-stopped
+
+    ports:
+      - "${PORT:-8000}:8000"
+
+    env_file:
+      - .env  
+
+    environment:
+      PORT: "8000"
+      PYTHONUNBUFFERED: "1"
+
+    volumes:
+
+      # ChromaDB vector store (persisted across container restarts)
+      - chroma_data:/app/.chroma_db
+
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import httpx; httpx.get('http://localhost:8000/health').raise_for_status()"]
+      interval: 30s
+      timeout: 10s
+      start_period: 90s
+      retries: 3
+
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 4g
+        reservations:
+          memory: 1g
+
+# ── Named volumes ──────────────────────────────────────────────────────────────
+volumes:
+  chroma_data:
+    driver: local

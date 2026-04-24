@@ -20,16 +20,6 @@ Three LangGraph agentic workflows:
    Computes per-day stats, generates rule-based insights,
    optional LLM narrative summary.
 
-LangGraph concepts demonstrated:
-    LG-4   StateGraph, TypedDict state, nodes, edges
-    LG-5   Sequential workflows (onboarding, weekly review)
-    LG-6   Parallel workflows (gap analysis — all days computed in parallel)
-    LG-7   Conditional workflows (onboarding skip logic, gap router)
-    LG-8   Iterative workflows (onboarding Q&A loop)
-    LG-9   PostgreSQL persistence (onboarding sessions)
-    LG-15  Human in the loop (gap analysis confirmation)
-    LG-19  Subgraphs (weekly review as subgraph)
-
 Install:
     pip install langgraph langchain langchain-community
                 psycopg[binary] --break-system-packages
@@ -967,14 +957,14 @@ def build_weekly_review_graph():
     Sequential: stats → insights → summary → END.
     """
     g = StateGraph(WeeklyReviewState)
-    g.add_node("stats",    _node_weekly_stats)
-    g.add_node("insights", _node_weekly_insights)
-    g.add_node("summary",  _node_weekly_summary)
+    g.add_node("fetch_stats",    _node_weekly_stats)
+    g.add_node("gen_insights", _node_weekly_insights)
+    g.add_node("gen_summary",  _node_weekly_summary)
 
-    g.set_entry_point("stats")
-    g.add_edge("stats",    "insights")
-    g.add_edge("insights", "summary")
-    g.add_edge("summary",  END)
+    g.set_entry_point("fetch_stats")
+    g.add_edge("fetch_stats",    "gen_insights")
+    g.add_edge("gen_insights", "gen_summary")
+    g.add_edge("gen_summary",  END)
 
     return g.compile()
 
