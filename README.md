@@ -60,7 +60,7 @@ Dual-model inference showed ~18.8% average disagreement across novel dishes, hig
 ## 🐳 Run with Docker
 
 ```bash
-docker pull us0005bit/nutriai
+docker pull us0005bit/nutriai:latest
 docker run -p 8000:8000 us0005bit/nutriai
 ```
 
